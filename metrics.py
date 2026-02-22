@@ -50,97 +50,113 @@ def calculate_review_turnaround(pr_created_at: str, review_submitted_at: str) ->
     return delta.total_seconds() / 3600
 
 
+def _collect_pr_stats(
+    merged_prs: list,
+    pr_sizes: dict,
+    stats: dict[str, EngineerStats],
+) -> None:
+    """Credit each PR author based on the size-weighted score of their merged PRs."""
+    for pr in merged_prs:
+        author = pr["user"]["login"]
+        size_info = pr_sizes.get(pr["number"], {"additions": 0, "deletions": 0})
+        size_label, weight = classify_pr_size(size_info["additions"], size_info["deletions"])
+
+        stats[author]["prs_merged"] += 1
+        stats[author][f"prs_{size_label.lower()}"] += 1
+        stats[author]["pr_score"] += weight
+
+
+def _collect_issue_stats(
+    closed_issues: list,
+    stats: dict[str, EngineerStats],
+) -> None:
+    """Credit the assignees of each closed issue (falls back to issue creator)."""
+    for issue in closed_issues:
+        assignees = issue.get("assignees", [])
+        recipients = [a["login"] for a in assignees] if assignees else [issue["user"]["login"]]
+        for login in recipients:
+            stats[login]["issues_closed"] += 1
+
+
+def _collect_review_stats(
+    merged_prs: list,
+    reviews_by_pr: dict,
+    stats: dict[str, EngineerStats],
+) -> None:
+    """Credit reviewers for each review given, excluding self-reviews."""
+    for pr in merged_prs:
+        author = pr["user"]["login"]
+        for review in reviews_by_pr.get(pr["number"], []):
+            reviewer = review.get("user", {}).get("login")
+            if not reviewer or reviewer == author:
+                continue
+
+            stats[reviewer]["reviews_given"] += 1
+
+            if review.get("submitted_at"):
+                hours = calculate_review_turnaround(pr["created_at"], review["submitted_at"])
+                stats[reviewer]["review_times"].append(hours)
+
+
+def _compute_impact_score(stats: EngineerStats) -> dict:
+    """Derive final scores and metadata from a single engineer's raw stats."""
+    pr_score = stats["pr_score"]
+    issue_score = stats["issues_closed"] * 2
+    review_score = stats["reviews_given"]
+    base_score = pr_score + issue_score + review_score
+
+    review_times = stats["review_times"]
+    avg_review_hours = sum(review_times) / len(review_times) if review_times else None
+
+    if avg_review_hours is None:
+        review_multiplier = 1.0       # no reviews — neutral
+    elif avg_review_hours < 24:
+        review_multiplier = 1.2       # fast reviewer bonus
+    elif avg_review_hours <= 72:
+        review_multiplier = 1.0       # acceptable — neutral
+    else:
+        review_multiplier = 0.8       # slow reviewer penalty
+
+    return {
+        "impact_score": round(base_score * review_multiplier, 1),
+        "pr_score": pr_score,
+        "issue_score": issue_score,
+        "avg_review_hours": round(avg_review_hours, 1) if avg_review_hours is not None else None,
+        "review_multiplier": review_multiplier,
+    }
+
+
 def calculate_engineer_metrics(
     merged_prs: list,
     closed_issues: list,
     reviews_by_pr: dict,
     pr_sizes: dict,
 ) -> pd.DataFrame:
-    """Calculate impact metrics for all engineers."""
-    engineer_stats: dict[str, EngineerStats] = defaultdict(create_default_stats)
+    """Aggregate GitHub activity into a ranked engineer impact DataFrame."""
+    stats: dict[str, EngineerStats] = defaultdict(create_default_stats)
 
-    # Process merged PRs
-    for pr in merged_prs:
-        author = pr["user"]["login"]
-        pr_number = pr["number"]
-        size_info = pr_sizes.get(pr_number, {"additions": 0, "deletions": 0})
-        size_label, weight = classify_pr_size(
-            size_info["additions"], size_info["deletions"]
-        )
+    _collect_pr_stats(merged_prs, pr_sizes, stats)
+    _collect_issue_stats(closed_issues, stats)
+    _collect_review_stats(merged_prs, reviews_by_pr, stats)
 
-        engineer_stats[author]["prs_merged"] += 1
-        engineer_stats[author][f"prs_{size_label.lower()}"] += 1
-        engineer_stats[author]["pr_score"] += weight
-
-    # Process closed issues
-    for issue in closed_issues:
-        # Issues may be closed by the assignee or the closer
-        assignees = issue.get("assignees", [])
-        if assignees:
-            for assignee in assignees:
-                engineer_stats[assignee["login"]]["issues_closed"] += 1
-        elif issue.get("user"):
-            # Fall back to issue creator if no assignee
-            engineer_stats[issue["user"]["login"]]["issues_closed"] += 1
-
-    # Process reviews
-    for pr in merged_prs:
-        pr_number = pr["number"]
-        pr_created = pr["created_at"]
-        reviews = reviews_by_pr.get(pr_number, [])
-
-        for review in reviews:
-            reviewer = review.get("user", {}).get("login")
-            if not reviewer:
-                continue
-
-            # Don't count self-reviews
-            if reviewer == pr["user"]["login"]:
-                continue
-
-            engineer_stats[reviewer]["reviews_given"] += 1
-
-            # Track review turnaround time
-            if review.get("submitted_at"):
-                turnaround = calculate_review_turnaround(pr_created, review["submitted_at"])
-                engineer_stats[reviewer]["review_times"].append(turnaround)
-
-    # Calculate final scores
-    results = []
-    for engineer, stats in engineer_stats.items():
-        # Base score components
-        pr_score = stats["pr_score"]
-        issue_score = stats["issues_closed"] * 2
-        review_score = stats["reviews_given"]
-
-        base_score = pr_score + issue_score + review_score
-
-        # Review turnaround bonus
-        review_times = stats["review_times"]
-        avg_review_time = sum(review_times) / len(review_times) if review_times else float("inf")
-        turnaround_bonus = 1.1 if avg_review_time < 24 else 1.0
-
-        impact_score = base_score * turnaround_bonus
-
-        results.append({
+    rows = [
+        {
             "engineer": engineer,
-            "impact_score": round(impact_score, 1),
-            "prs_merged": stats["prs_merged"],
-            "prs_small": stats["prs_small"],
-            "prs_medium": stats["prs_medium"],
-            "prs_large": stats["prs_large"],
-            "pr_score": pr_score,
-            "issues_closed": stats["issues_closed"],
-            "issue_score": issue_score,
-            "reviews_given": stats["reviews_given"],
-            "avg_review_hours": round(avg_review_time, 1) if review_times else None,
-            "has_turnaround_bonus": turnaround_bonus > 1,
-        })
+            "prs_merged": s["prs_merged"],
+            "prs_small": s["prs_small"],
+            "prs_medium": s["prs_medium"],
+            "prs_large": s["prs_large"],
+            "issues_closed": s["issues_closed"],
+            "reviews_given": s["reviews_given"],
+            **_compute_impact_score(s),
+        }
+        for engineer, s in stats.items()
+        if not engineer.endswith("[bot]")
+    ]
 
-    df = pd.DataFrame(results)
+    df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("impact_score", ascending=False).reset_index(drop=True)
-
     return df
 
 

@@ -127,8 +127,11 @@ for i, row in top_5.iterrows():
             st.metric("Reviews Given", row["reviews_given"])
             if row["avg_review_hours"]:
                 st.metric("Avg Review Time", f"{row['avg_review_hours']}h")
-                if row["has_turnaround_bonus"]:
-                    st.success("🚀 Fast reviewer bonus (+10%)")
+                multiplier = row["review_multiplier"]
+                if multiplier > 1.0:
+                    st.success("Fast reviewer (+20%)")
+                elif multiplier < 1.0:
+                    st.warning("Slow reviewer (-20%)")
 
         with col2:
             # Score breakdown pie chart
