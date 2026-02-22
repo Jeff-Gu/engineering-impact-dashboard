@@ -39,7 +39,9 @@ with st.sidebar:
       (PRs × Size Weight)
     + (Issues Closed × 2)
     + (Reviews Given)
-    × (1.1 if avg review < 24h)
+    × (1.2 if avg review < 24h
+       1.0 if avg review <= 72h
+       0.8 if avg review > 72h)
     ```
 
     **PR Size Weights:**
@@ -116,7 +118,7 @@ st.plotly_chart(fig_bar, use_container_width=True)
 # Engineer cards and breakdown
 st.subheader("Top 5 Engineers Breakdown")
 
-for i, row in top_5.iterrows():
+for i, (_, row) in enumerate(top_5.iterrows()):
     with st.expander(f"#{i+1} {row['engineer']} - Score: {row['impact_score']}", expanded=(i == 0)):
         col1, col2 = st.columns([1, 2])
 
@@ -155,7 +157,7 @@ st.subheader("Full Leaderboard")
 with st.expander("View all engineers"):
     display_df = df[["engineer", "impact_score", "prs_merged", "issues_closed", "reviews_given"]].copy()
     display_df.columns = ["Engineer", "Impact Score", "PRs Merged", "Issues Closed", "Reviews Given"]
-    display_df.index = range(1, len(display_df) + 1)
+    display_df.index = pd.RangeIndex(start=1, stop=len(display_df) + 1)
     display_df.index.name = "Rank"
     st.dataframe(display_df, use_container_width=True)
 
